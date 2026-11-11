@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Oxímetro - Agente</title>
+    <style>
+        body { font-family: Arial, sans-serif; background-color: #121212; color: #fff; margin: 0; padding: 15px; }
+        .card { background: #1e1e1e; padding: 15px; border-radius: 10px; margin-bottom: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        h2 { margin-top: 0; }
+        .metrics { display: flex; justify-content: space-between; font-size: 1.2rem; margin-bottom: 10px; }
+        .val { font-weight: bold; color: #00e676; }
+        canvas { width: 100%; height: 250px; background-color: #000; border-radius: 8px; }
+        button { background-color: #2979ff; color: white; border: none; padding: 12px 20px; font-size: 1rem; border-radius: 5px; width: 100%; margin-top: 10px; cursor: pointer; }
+        button:disabled { background-color: #555; }
+        .btn-download { background-color: #00c853; margin-top: 10px; }
+        .btn-relay-on { background-color: #7c4dff; margin-top: 10px; }
+        .btn-relay-off { background-color: #c62828; margin-top: 10px; }
+        label { display: block; margin-top: 12px; font-size: 0.9rem; color: #aaa; }
+        input { width: 100%; box-sizing: border-box; padding: 10px; margin-top: 4px;
+                border-radius: 5px; border: 1px solid #333; background: #000; color: #fff; font-size: 1rem; }
+        .status { margin-top: 8px; font-size: 0.9rem; color: #aaa; }
+        .erro  { color: #ff5252; }
+    </style>
+</head>
+<body>
+
+    <div class="card">
+        <h2>Painel do Oxímetro</h2>
+        <div class="metrics">
+            <div>SpO₂: <span id="spo2Val" class="val">-- %</span></div>
+            <div>Razão (R): <span id="rVal" class="val">--</span></div>
+        </div>
+        <button id="btnConnect">Conectar ao Oxímetro (Serial/BT)</button>
+        <button id="btnDownload" class="btn-download" disabled>Baixar Relatório (.CSV)</button>
+
+        <label>URL do relay
+            <input id="relayUrl" placeholder="wss://SEU_RELAY.onrender.com">
+        </label>
+        <label>Token do produtor
+            <input id="token" type="password" autocomplete="off">
+        </label>
+        <button id="btnRelay" class="btn-relay-on">Enviar dados ao servidor</button>
+
+        <div id="lblRelay" class="status">Servidor: desconectado</div>
+        <div id="lblErro"  class="status erro"></div>
+    </div>
+
+    <div class="card">
+        <canvas id="osciloscopeCanvas"></canvas>
+    </div>
+
+    <script>
+        // ====== ELEMENTOS ======
+        const btnConnect  = document.getElementById('btnConnect');
+        const btnDownload = document.getElementById('btnDownload');
+        const btnRelay    = document.getElementById('btnRelay');
+        const relayInput  = document.getElementById('relayUrl');
+        const tokenInput  = document.getElementById('token');
+        const spo2Val     = document.getElementById('spo2Val');
+        const rVal        = document.getElementById('rVal');
+        const lblRelay    = document.getElementById('lblRelay');
+        const lblErro     = document.getElementById('lblErro');
+        const canvas      = document.getElementById('osciloscopeCanvas');
+        const ctx         = canvas.getContext('2d');
+
+        canvas.width  = canvas.offsetWidth;
+        canvas.height = canvas.offsetHeight;
+
+        // ====== ESTADO ======
+        let csvRows    = ["Tempo_ms,Canal,Val_Raw,Val_Filtrado,SpO2,R\n"];
+        let dataBuffer = [];
+        const maxPoints = 500;
+
+        // relay
+        let ws           = null;
+        let relayAtivo   = false;
+        let authFalhou   = false;
+        let retryTimer   = null;
+        let fila         = "";          // linhas aguardando envio
+        const FLUSH_MS   = 200;         // intervalo de envio em lote
+        const MAX_FILA   = 200000;      // limite de chars guardados quando o servidor cai
+        const RETRY_MS   = 3000;
+
+        // Restaura URL salva
+        relayInput.value = localStorage.getItem('oxRelayUrl') || '';
+        relayInput.addEventListener('change', () =>
+            localStorage.setItem('oxRelayUrl', relayInput.value.trim()));
+
+        function erro(msg) { lblErro.innerText = msg || ''; }
+
+        // ====== WEB SERIAL (igual ao original) ======
+        btnConnect.addEventListener('click', async () => {
+            if (!('serial' in navigator)) {
+                alert("Navegador não suporta Web Serial API. Use o Chrome no Android.");
+                return;
+            }
+            try {
+                const port = await navigator.serial.requestPort();
+                await port.open({ baudRate: 115200 });
+                btnConnect.innerText = "Conectado e Lendo Dados...";
+                btnConnect.disabled  = true;
+                btnDownload.disabled = false;
+
+                const textDecoder = new TextDecoderStream();
+                port.readable.pipeTo(textDecoder.writable);
+                const reader = textDecoder.readable.getReader();
+                let incomingBuffer = "";
+
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+
+                    incomingBuffer += value;
+                    const lines = incomingBuffer.split("\n");
+                    incomingBuffer = lines.pop(); // pedaço incompleto
+
+                    let houveGrafico = false;
+                    for (const line of lines) {
+                        if (processLine(line.trim())) houveGrafico = true;
+                    }
+                    if (houveGrafico) drawOscilloscope();
+                }
+            } catch (err) {
+                alert("Erro ao conectar: " + err);
+                btnConnect.disabled  = false;
+                btnConnect.innerText = "Conectar ao Oxímetro (Serial/BT)";
+            }
+        });
+
+        // ====== PROCESSAMENTO (igual ao original + enfileiramento) ======
+        // Retorna true quando adiciona ponto ao gráfico
+        function processLine(line) {
+            if (!line) return false;
+            csvRows.push(line + "\n");
+
+            // Enfileira para o relay se ativo
+            if (relayAtivo) {
+                fila += line + "\n";
+                if (fila.length > MAX_FILA) fila = fila.slice(fila.length - MAX_FILA);
+            }
+
+            const parts = line.split(",");
+            if (parts.length !== 6) return false;
+
+            const canal   = parts[1];
+            const valFilt = parseFloat(parts[3]);
+            const spo2    = parseFloat(parts[4]);
+            const r       = parseFloat(parts[5]);
+
+            if (canal === 'CALC' && spo2 > 0) {
+                spo2Val.innerText = spo2.toFixed(1) + " %";
+                rVal.innerText    = r.toFixed(3);
+                return false;
+            }
+            if (canal.includes('RED') || canal.includes('IR')) {
+                dataBuffer.push({ val: valFilt, isRed: canal.includes('RED') });
+                if (dataBuffer.length > maxPoints) dataBuffer.shift();
+                return true;
+            }
+            return false;
+        }
+
+        function drawOscilloscope() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            if (dataBuffer.length < 2) return;
+
+            ctx.lineWidth = 2;
+            let min = Infinity, max = -Infinity;
+            for (const d of dataBuffer) {
+                if (d.val < min) min = d.val;
+                if (d.val > max) max = d.val;
+            }
+            const range = (max - min) || 1;
+
+            for (let i = 1; i < dataBuffer.length; i++) {
+                const x0 = ((i - 1) / maxPoints) * canvas.width;
+                const y0 = canvas.height - ((dataBuffer[i-1].val - min) / range) * (canvas.height - 20) - 10;
+                const x1 = (i       / maxPoints) * canvas.width;
+                const y1 = canvas.height - ((dataBuffer[i  ].val - min) / range) * (canvas.height - 20) - 10;
+                ctx.beginPath();
+                ctx.strokeStyle = dataBuffer[i].isRed ? "#ff1744" : "#29b6f6";
+                ctx.moveTo(x0, y0);
+                ctx.lineTo(x1, y1);
+                ctx.stroke();
+            }
+        }
+
+        // ====== RELAY (novo) ======
+        btnRelay.addEventListener('click', () => {
+            if (relayAtivo) { pararRelay(); return; }
+
+            const base = relayInput.value.trim();
+            if (!/^wss?:\/\//.test(base)) {
+                erro('Informe a URL do relay começando com wss://');
+                return;
+            }
+            erro('');
+            authFalhou = false;
+            relayAtivo = true;
+            btnRelay.innerText = "Parar envio ao servidor";
+            btnRelay.className = "btn-relay-off";
+            abrirWS();
+        });
+
+        function abrirWS() {
+            if (!relayAtivo || authFalhou) return;
+            const base = relayInput.value.trim();
+            const sep  = base.includes('?') ? '&' : '?';
+            const url  = base + sep + 'role=producer&token=' + encodeURIComponent(tokenInput.value);
+
+            lblRelay.innerText = "Servidor: conectando...";
+            ws = new WebSocket(url);
+
+            ws.onopen = () => {
+                lblRelay.innerText = "Servidor: conectado — enviando dados";
+                erro('');
+            };
+            ws.onclose = (e) => {
+                ws = null;
+                if (e.code === 4001) {
+                    authFalhou = true;
+                    pararRelay();
+                    erro('Token recusado pelo servidor. Corrija e tente novamente.');
+                    return;
+                }
+                if (relayAtivo) {
+                    lblRelay.innerText = "Servidor: desconectado — tentando novamente...";
+                    clearTimeout(retryTimer);
+                    retryTimer = setTimeout(abrirWS, RETRY_MS);
+                }
+            };
+            ws.onerror = () => ws && ws.close();
+        }
+
+        function pararRelay() {
+            relayAtivo = false;
+            clearTimeout(retryTimer);
+            if (ws) { ws.onclose = null; ws.close(); ws = null; }
+            fila = "";
+            lblRelay.innerText = "Servidor: desconectado";
+            btnRelay.innerText = "Enviar dados ao servidor";
+            btnRelay.className = "btn-relay-on";
+        }
+
+        // Envia o lote acumulado a cada 200 ms
+        setInterval(() => {
+            if (fila && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(fila);
+                fila = "";
+            }
+        }, FLUSH_MS);
+
+        // ====== DOWNLOAD CSV (igual ao original) ======
+        btnDownload.addEventListener('click', () => {
+            const blob = new Blob(csvRows, { type: 'text/csv' });
+            const url  = window.URL.createObjectURL(blob);
+            const a    = document.createElement('a');
+            a.setAttribute('href', url);
+            a.setAttribute('download', `oximetria_dados_${Date.now()}.csv`);
+            a.click();
+            setTimeout(() => window.URL.revokeObjectURL(url), 1000);
+        });
+    </script>
+</body>
+</html>
